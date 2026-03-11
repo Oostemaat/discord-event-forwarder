@@ -1,4 +1,6 @@
 require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
 const { Client, GatewayIntentBits, Events } = require('discord.js');
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 
@@ -10,6 +12,9 @@ const GUILD_ID = process.env.GUILD_ID;
 const EVENT_SYNC_INTERVAL_MS = Number(process.env.EVENT_SYNC_INTERVAL_MS || 15 * 60 * 1000);
 const MEMBER_SYNC_INTERVAL_MS = Number(process.env.MEMBER_SYNC_INTERVAL_MS || 6 * 60 * 60 * 1000);
 const WEBHOOK_RETRIES = Number(process.env.WEBHOOK_RETRIES || 3);
+const EVENT_RETENTION_DAYS = Number(process.env.EVENT_RETENTION_DAYS || 30);
+
+const EVENT_STORE_FILE = path.join(__dirname, 'event-store.json');
 
 const client = new Client({
   intents: [
@@ -24,6 +29,11 @@ function sleep(ms) {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function safeDateMs(value) {
+  const n = Number(value || 0);
+  return Number.isFinite(n) ? n : 0;
 }
 
 async function sendWebhook(data) {
@@ -66,9 +76,12 @@ async function sendWebhook(data) {
 }
 
 function formatDuration(startMs, endMs) {
-  if (!startMs || !endMs || endMs <= startMs) return '';
+  const start = safeDateMs(startMs);
+  const end = safeDateMs(endMs);
 
-  const totalMinutes = Math.floor((endMs - startMs) / 60000);
+  if (!start || !end || end <= start) return '';
+
+  const totalMinutes = Math.floor((end - start) / 60000);
   const hours = Math.floor(totalMinutes / 60);
   const minutes = totalMinutes % 60;
 
@@ -88,12 +101,12 @@ function mapDiscordStatus(eventStatus) {
 }
 
 function buildEventPayload(event, interestedCount) {
-  const startMs = event.scheduledStartTimestamp || '';
-  const endMs = event.scheduledEndTimestamp || '';
+  const startMs = safeDateMs(event.scheduledStartTimestamp);
+  const endMs = safeDateMs(event.scheduledEndTimestamp);
   const uniqueInterested = Number(interestedCount || 0);
 
   return {
-    id: event.id,
+    id: String(event.id || ''),
     name: event.name || '',
     startTime: startMs || '',
     endTime: endMs || '',
@@ -104,6 +117,82 @@ function buildEventPayload(event, interestedCount) {
     uniqueInterested: uniqueInterested,
     url: `https://discord.com/events/${event.guildId}/${event.id}`
   };
+}
+
+function readEventStore() {
+  try {
+    if (!fs.existsSync(EVENT_STORE_FILE)) return {};
+    const raw = fs.readFileSync(EVENT_STORE_FILE, 'utf8');
+    return raw ? JSON.parse(raw) : {};
+  } catch (err) {
+    console.log(`[${nowIso()}] Failed reading event store: ${err.message}`);
+    return {};
+  }
+}
+
+function writeEventStore(store) {
+  try {
+    fs.writeFileSync(EVENT_STORE_FILE, JSON.stringify(store, null, 2), 'utf8');
+  } catch (err) {
+    console.log(`[${nowIso()}] Failed writing event store: ${err.message}`);
+  }
+}
+
+function upsertStoredEvent(eventPayload) {
+  if (!eventPayload || !eventPayload.id) return;
+
+  const store = readEventStore();
+  const existing = store[eventPayload.id] || {};
+
+  store[eventPayload.id] = {
+    id: eventPayload.id,
+    name: eventPayload.name || existing.name || '',
+    startTime: eventPayload.startTime || existing.startTime || '',
+    endTime: eventPayload.endTime || existing.endTime || '',
+    duration: eventPayload.duration || existing.duration || '',
+    status: eventPayload.status || existing.status || 'Unknown',
+    channelId: eventPayload.channelId || existing.channelId || '',
+    interestedCount: Number(eventPayload.interestedCount || 0),
+    uniqueInterested: Number(eventPayload.uniqueInterested || 0),
+    url: eventPayload.url || existing.url || '',
+    guildId: GUILD_ID,
+    lastSeenAt: nowIso(),
+    finalised: existing.finalised === true ? true : false
+  };
+
+  writeEventStore(store);
+}
+
+function markStoredEventStatus(eventId, status) {
+  const store = readEventStore();
+  if (!store[eventId]) return;
+
+  store[eventId].status = status;
+  store[eventId].lastSeenAt = nowIso();
+
+  if (status === 'Done' || status === 'Cancelled') {
+    store[eventId].finalised = true;
+  }
+
+  writeEventStore(store);
+}
+
+function pruneOldStoredEvents() {
+  const store = readEventStore();
+  const cutoff = Date.now() - (EVENT_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+
+  for (const eventId of Object.keys(store)) {
+    const item = store[eventId];
+    const endMs = item && item.endTime ? new Date(item.endTime).getTime() : 0;
+    const lastSeenMs = item && item.lastSeenAt ? new Date(item.lastSeenAt).getTime() : 0;
+    const refMs = Math.max(endMs || 0, lastSeenMs || 0);
+
+    if (refMs && refMs < cutoff) {
+      delete store[eventId];
+    }
+  }
+
+  writeEventStore(store);
 }
 
 async function fetchAllSubscribers(event) {
@@ -180,10 +269,14 @@ async function syncSingleEvent(guild, event) {
       ? event.userCount
       : subscribers.length;
 
+  const payload = buildEventPayload(event, interestedCount);
+
   await sendWebhook({
     type: 'sync_event',
-    event: buildEventPayload(event, interestedCount)
+    event: payload
   });
+
+  upsertStoredEvent(payload);
 
   const users = [];
   for (const subscriber of subscribers) {
@@ -202,6 +295,44 @@ async function syncSingleEvent(guild, event) {
   console.log(`[${nowIso()}] Synced event: ${event.name} (${interestedCount} interested)`);
 }
 
+async function sendFinalDoneForMissingEvents(liveEventIds) {
+  const store = readEventStore();
+  const now = Date.now();
+
+  for (const eventId of Object.keys(store)) {
+    const stored = store[eventId];
+    if (!stored) continue;
+    if (liveEventIds.has(eventId)) continue;
+    if (stored.finalised === true) continue;
+
+    const endMs = stored.endTime ? new Date(stored.endTime).getTime() : 0;
+    const startMs = stored.startTime ? new Date(stored.startTime).getTime() : 0;
+
+    if (endMs && now >= endMs) {
+      const payload = {
+        id: stored.id,
+        name: stored.name || '',
+        startTime: stored.startTime || '',
+        endTime: stored.endTime || '',
+        duration: stored.duration || formatDuration(startMs, endMs),
+        status: 'Done',
+        channelId: stored.channelId || '',
+        interestedCount: Number(stored.interestedCount || 0),
+        uniqueInterested: Number(stored.uniqueInterested || 0),
+        url: stored.url || `https://discord.com/events/${GUILD_ID}/${stored.id}`
+      };
+
+      await sendWebhook({
+        type: 'event_update',
+        event: payload
+      });
+
+      markStoredEventStatus(eventId, 'Done');
+      console.log(`[${nowIso()}] Finalised missing event as Done: ${stored.name} (${stored.id})`);
+    }
+  }
+}
+
 async function syncExistingEventsAndUsers(reason = 'manual') {
   console.log(`[${nowIso()}] Event sync started (${reason})`);
 
@@ -211,9 +342,15 @@ async function syncExistingEventsAndUsers(reason = 'manual') {
 
     console.log(`[${nowIso()}] Found ${events.size} scheduled event(s)`);
 
+    const liveEventIds = new Set();
+
     for (const [, event] of events) {
+      liveEventIds.add(event.id);
       await syncSingleEvent(guild, event);
     }
+
+    await sendFinalDoneForMissingEvents(liveEventIds);
+    pruneOldStoredEvents();
 
     console.log(`[${nowIso()}] Event sync finished (${reason})`);
   } catch (err) {
@@ -268,22 +405,28 @@ client.on('guildScheduledEventCreate', async (event) => {
   if (event.guildId !== GUILD_ID) return;
 
   const interestedCount = await getInterestedCount(event);
+  const payload = buildEventPayload(event, interestedCount);
 
   await sendWebhook({
     type: 'event_create',
-    event: buildEventPayload(event, interestedCount)
+    event: payload
   });
+
+  upsertStoredEvent(payload);
 });
 
 client.on('guildScheduledEventUpdate', async (_oldEvent, event) => {
   if (event.guildId !== GUILD_ID) return;
 
   const interestedCount = await getInterestedCount(event);
+  const payload = buildEventPayload(event, interestedCount);
 
   await sendWebhook({
     type: 'event_update',
-    event: buildEventPayload(event, interestedCount)
+    event: payload
   });
+
+  upsertStoredEvent(payload);
 
   const subscribers = await fetchAllSubscribers(event);
   const guild = await client.guilds.fetch(GUILD_ID);
@@ -292,14 +435,14 @@ client.on('guildScheduledEventUpdate', async (_oldEvent, event) => {
     type: 'sync_interest_snapshot',
     eventId: event.id,
     eventName: event.name,
-    users: await Promise.all(
+    users: dedupeUsersByName(await Promise.all(
       subscribers.map(async (subscriber) => {
         const member = await guild.members.fetch(subscriber.user.id).catch(() => null);
         return {
           username: member ? member.displayName : (subscriber.user?.username || '')
         };
       })
-    )
+    ))
   });
 });
 
@@ -307,12 +450,19 @@ client.on('guildScheduledEventDelete', async (event) => {
   if (event.guildId !== GUILD_ID) return;
 
   const payload = buildEventPayload(event, 0);
-  payload.status = 'Cancelled';
+
+  const now = Date.now();
+  const endMs = safeDateMs(event.scheduledEndTimestamp);
+
+  payload.status = endMs && now >= endMs ? 'Done' : 'Cancelled';
 
   await sendWebhook({
     type: 'event_update',
     event: payload
   });
+
+  upsertStoredEvent(payload);
+  markStoredEventStatus(event.id, payload.status);
 
   await sendWebhook({
     type: 'sync_interest_snapshot',
@@ -321,7 +471,7 @@ client.on('guildScheduledEventDelete', async (event) => {
     users: []
   });
 
-  console.log(`[${nowIso()}] Event cancelled/deleted: ${event.name}`);
+  console.log(`[${nowIso()}] Event removed: ${event.name} -> ${payload.status}`);
 });
 
 client.on('guildScheduledEventUserAdd', async (event, user) => {
@@ -338,11 +488,14 @@ client.on('guildScheduledEventUserAdd', async (event, user) => {
   });
 
   const interestedCount = await getInterestedCount(event);
+  const payload = buildEventPayload(event, interestedCount);
 
   await sendWebhook({
     type: 'event_update',
-    event: buildEventPayload(event, interestedCount)
+    event: payload
   });
+
+  upsertStoredEvent(payload);
 });
 
 client.on('guildScheduledEventUserRemove', async (event, user) => {
@@ -359,11 +512,14 @@ client.on('guildScheduledEventUserRemove', async (event, user) => {
   });
 
   const interestedCount = await getInterestedCount(event);
+  const payload = buildEventPayload(event, interestedCount);
 
   await sendWebhook({
     type: 'event_update',
-    event: buildEventPayload(event, interestedCount)
+    event: payload
   });
+
+  upsertStoredEvent(payload);
 });
 
 process.on('SIGTERM', () => {
