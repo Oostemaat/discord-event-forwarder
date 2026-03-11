@@ -264,16 +264,6 @@ function updateAttendanceEventStatus(eventPayload) {
   writeAttendanceStore(store);
 }
 
-function isEventStartedByTime(att) {
-  const now = Date.now();
-  const startMs = att.startTime ? new Date(att.startTime).getTime() : 0;
-  const endMs = att.endTime ? new Date(att.endTime).getTime() : 0;
-
-  if (endMs && now >= endMs) return false;
-  if (startMs && now >= startMs) return true;
-  return att.status === 'Started';
-}
-
 function addAttendanceUser(eventId, userId, username) {
   const store = readAttendanceStore();
   const att = store[eventId];
@@ -313,9 +303,27 @@ function getTrackedEventsByChannel(channelId) {
   const store = readAttendanceStore();
   return Object.values(store).filter(att =>
     String(att.channelId || '') === String(channelId || '') &&
-    att.finalised !== true &&
-    isEventStartedByTime(att)
+    att.finalised !== true
   );
+}
+
+async function sendLiveAttendanceSnapshot(eventId) {
+  const store = readAttendanceStore();
+  const att = store[eventId];
+  if (!att) return;
+
+  const users = Object.values(att.joinedUsers || {})
+    .map(u => ({ username: u.username || '' }))
+    .filter(u => u.username);
+
+  await sendWebhook({
+    type: 'attendance_snapshot',
+    eventId: att.eventId,
+    eventName: att.eventName,
+    users
+  });
+
+  console.log(`[${nowIso()}] Sent live attendance snapshot for ${att.eventName}: ${users.length} attendee(s)`);
 }
 
 async function sendAttendanceSnapshot(eventId) {
@@ -338,7 +346,29 @@ async function sendAttendanceSnapshot(eventId) {
   store[eventId] = att;
   writeAttendanceStore(store);
 
-  console.log(`[${nowIso()}] Sent attendance snapshot for ${att.eventName}: ${users.length} unique attendees`);
+  console.log(`[${nowIso()}] Sent final attendance snapshot for ${att.eventName}: ${users.length} unique attendees`);
+}
+
+async function captureCurrentVoiceMembersForEvent(guild, eventPayload) {
+  if (!eventPayload || !eventPayload.id || !eventPayload.channelId) return;
+
+  try {
+    const channel = await guild.channels.fetch(eventPayload.channelId).catch(() => null);
+    if (!channel || !channel.members) return;
+
+    channel.members.forEach(member => {
+      addAttendanceUser(
+        eventPayload.id,
+        member.id,
+        member.displayName || member.user?.username || ''
+      );
+    });
+
+    await sendLiveAttendanceSnapshot(eventPayload.id);
+    console.log(`[${nowIso()}] Captured current voice members for ${eventPayload.name}: ${channel.members.size}`);
+  } catch (err) {
+    console.log(`[${nowIso()}] Failed capturing voice members for ${eventPayload.name}: ${err.message}`);
+  }
 }
 
 async function fetchAllSubscribers(event) {
@@ -440,9 +470,9 @@ async function syncSingleEvent(guild, event) {
   upsertStoredEvent(payload);
   ensureAttendanceEvent(payload);
   updateAttendanceEventStatus(payload);
+  await captureCurrentVoiceMembersForEvent(guild, payload);
 
   const users = [];
-
   for (const subscriber of subscribers) {
     const fallback = subscriber.user?.username || '';
     const displayName = await resolveDisplayName(guild, subscriber.user.id, fallback);
@@ -471,12 +501,17 @@ async function finaliseMissingEvents(liveEventIds) {
 
     const startMs = stored.startTime ? new Date(stored.startTime).getTime() : 0;
     const endMs = stored.endTime ? new Date(stored.endTime).getTime() : 0;
+    const previousStatus = String(stored.status || '').trim();
 
     let finalStatus = '';
     let rawStatusCode = 0;
     let statusSource = '';
 
-    if (endMs && now >= endMs) {
+    if (previousStatus === 'Started') {
+      finalStatus = 'Done';
+      rawStatusCode = 3;
+      statusSource = 'bot_missing_started_then_gone';
+    } else if (endMs && now >= endMs) {
       finalStatus = 'Done';
       rawStatusCode = 3;
       statusSource = 'bot_missing_finished';
@@ -510,7 +545,7 @@ async function finaliseMissingEvents(liveEventIds) {
     updateAttendanceEventStatus(payload);
     await sendAttendanceSnapshot(eventId);
 
-    console.log(`[${nowIso()}] Finalised missing event as ${finalStatus}: ${stored.name} (${stored.id})`);
+    console.log(`[${nowIso()}] Finalised missing event as ${finalStatus}: ${stored.name} (${stored.id}) previousStatus=${previousStatus}`);
   }
 }
 
@@ -596,6 +631,9 @@ client.on('guildScheduledEventCreate', async (event) => {
   upsertStoredEvent(payload);
   ensureAttendanceEvent(payload);
   updateAttendanceEventStatus(payload);
+
+  const guild = await client.guilds.fetch(GUILD_ID);
+  await captureCurrentVoiceMembersForEvent(guild, payload);
 });
 
 client.on('guildScheduledEventUpdate', async (_oldEvent, event) => {
@@ -613,8 +651,10 @@ client.on('guildScheduledEventUpdate', async (_oldEvent, event) => {
   ensureAttendanceEvent(payload);
   updateAttendanceEventStatus(payload);
 
-  const subscribers = await fetchAllSubscribers(event);
   const guild = await client.guilds.fetch(GUILD_ID);
+  await captureCurrentVoiceMembersForEvent(guild, payload);
+
+  const subscribers = await fetchAllSubscribers(event);
 
   await sendWebhook({
     type: 'sync_interest_snapshot',
@@ -637,9 +677,10 @@ client.on('guildScheduledEventDelete', async (event) => {
   const payload = buildEventPayload(event, 0);
 
   const now = Date.now();
+  const startMs = safeDateMs(event.scheduledStartTimestamp);
   const endMs = safeDateMs(event.scheduledEndTimestamp);
 
-  if (endMs && now >= endMs) {
+  if ((startMs && now >= startMs) || (endMs && now >= endMs)) {
     payload.status = 'Done';
     payload.rawStatusCode = 3;
     payload.statusSource = 'bot_delete_finished';
@@ -738,6 +779,7 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
       const leavingEvents = getTrackedEventsByChannel(oldChannelId);
       for (const att of leavingEvents) {
         removeAttendanceUser(att.eventId, userId);
+        await sendLiveAttendanceSnapshot(att.eventId);
       }
     }
 
@@ -745,6 +787,7 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
       const joiningEvents = getTrackedEventsByChannel(newChannelId);
       for (const att of joiningEvents) {
         addAttendanceUser(att.eventId, userId, username);
+        await sendLiveAttendanceSnapshot(att.eventId);
       }
     }
   } catch (err) {
