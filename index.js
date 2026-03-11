@@ -233,7 +233,8 @@ async function syncGuildMembers(reason = 'manual') {
       payload.push({
         discordId: member.id,
         displayName: member.displayName,
-        username: member.user?.username || ''
+        username: member.user?.username || '',
+        isBot: member.user?.bot === true
       });
     });
 
