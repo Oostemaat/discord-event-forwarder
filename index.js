@@ -104,6 +104,7 @@ function buildEventPayload(event, interestedCount) {
   const startMs = safeDateMs(event.scheduledStartTimestamp);
   const endMs = safeDateMs(event.scheduledEndTimestamp);
   const uniqueInterested = Number(interestedCount || 0);
+  const rawStatusCode = Number(event.status || 0);
 
   return {
     id: String(event.id || ''),
@@ -111,10 +112,12 @@ function buildEventPayload(event, interestedCount) {
     startTime: startMs || '',
     endTime: endMs || '',
     duration: formatDuration(startMs, endMs),
-    status: mapDiscordStatus(event.status),
+    status: mapDiscordStatus(rawStatusCode),
+    rawStatusCode,
+    statusSource: 'discord',
     channelId: event.channelId || '',
     interestedCount: uniqueInterested,
-    uniqueInterested: uniqueInterested,
+    uniqueInterested,
     url: `https://discord.com/events/${event.guildId}/${event.id}`
   };
 }
@@ -151,6 +154,8 @@ function upsertStoredEvent(eventPayload) {
     endTime: eventPayload.endTime || existing.endTime || '',
     duration: eventPayload.duration || existing.duration || '',
     status: eventPayload.status || existing.status || 'Unknown',
+    rawStatusCode: Number(eventPayload.rawStatusCode || existing.rawStatusCode || 0),
+    statusSource: eventPayload.statusSource || existing.statusSource || '',
     channelId: eventPayload.channelId || existing.channelId || '',
     interestedCount: Number(eventPayload.interestedCount || 0),
     uniqueInterested: Number(eventPayload.uniqueInterested || 0),
@@ -163,11 +168,13 @@ function upsertStoredEvent(eventPayload) {
   writeEventStore(store);
 }
 
-function markStoredEventStatus(eventId, status) {
+function markStoredEventStatus(eventId, status, rawStatusCode, statusSource) {
   const store = readEventStore();
   if (!store[eventId]) return;
 
   store[eventId].status = status;
+  store[eventId].rawStatusCode = Number(rawStatusCode || 0);
+  store[eventId].statusSource = statusSource || store[eventId].statusSource || '';
   store[eventId].lastSeenAt = nowIso();
 
   if (status === 'Done' || status === 'Cancelled') {
@@ -316,6 +323,8 @@ async function sendFinalDoneForMissingEvents(liveEventIds) {
         endTime: stored.endTime || '',
         duration: stored.duration || formatDuration(startMs, endMs),
         status: 'Done',
+        rawStatusCode: 3,
+        statusSource: 'bot_missing_finished',
         channelId: stored.channelId || '',
         interestedCount: Number(stored.interestedCount || 0),
         uniqueInterested: Number(stored.uniqueInterested || 0),
@@ -327,7 +336,7 @@ async function sendFinalDoneForMissingEvents(liveEventIds) {
         event: payload
       });
 
-      markStoredEventStatus(eventId, 'Done');
+      markStoredEventStatus(eventId, 'Done', 3, 'bot_missing_finished');
       console.log(`[${nowIso()}] Finalised missing event as Done: ${stored.name} (${stored.id})`);
     }
   }
@@ -454,7 +463,15 @@ client.on('guildScheduledEventDelete', async (event) => {
   const now = Date.now();
   const endMs = safeDateMs(event.scheduledEndTimestamp);
 
-  payload.status = endMs && now >= endMs ? 'Done' : 'Cancelled';
+  if (endMs && now >= endMs) {
+    payload.status = 'Done';
+    payload.rawStatusCode = 3;
+    payload.statusSource = 'bot_delete_finished';
+  } else {
+    payload.status = 'Cancelled';
+    payload.rawStatusCode = 4;
+    payload.statusSource = 'bot_delete_cancelled';
+  }
 
   await sendWebhook({
     type: 'event_update',
@@ -462,7 +479,7 @@ client.on('guildScheduledEventDelete', async (event) => {
   });
 
   upsertStoredEvent(payload);
-  markStoredEventStatus(event.id, payload.status);
+  markStoredEventStatus(event.id, payload.status, payload.rawStatusCode, payload.statusSource);
 
   await sendWebhook({
     type: 'sync_interest_snapshot',
