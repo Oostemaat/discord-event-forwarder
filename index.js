@@ -7,27 +7,62 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const SECRET = process.env.WEBHOOK_SECRET;
 const GUILD_ID = process.env.GUILD_ID;
 
+const EVENT_SYNC_INTERVAL_MS = Number(process.env.EVENT_SYNC_INTERVAL_MS || 15 * 60 * 1000);
+const MEMBER_SYNC_INTERVAL_MS = Number(process.env.MEMBER_SYNC_INTERVAL_MS || 6 * 60 * 60 * 1000);
+const WEBHOOK_RETRIES = Number(process.env.WEBHOOK_RETRIES || 3);
+
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds]
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers
+  ]
 });
 
-async function sendWebhook(data) {
-  try {
-    const res = await fetch(WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        secret: SECRET,
-        ...data
-      })
-    });
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
-    const text = await res.text();
-    console.log('Webhook status:', res.status);
-    console.log('Webhook response:', text);
-  } catch (err) {
-    console.log('Webhook error:', err);
+function nowIso() {
+  return new Date().toISOString();
+}
+
+async function sendWebhook(data) {
+  let attempt = 0;
+  let lastError = null;
+
+  while (attempt < WEBHOOK_RETRIES) {
+    attempt += 1;
+
+    try {
+      const res = await fetch(WEBHOOK_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          secret: SECRET,
+          ...data
+        })
+      });
+
+      const text = await res.text();
+
+      if (!res.ok) {
+        lastError = new Error(`HTTP ${res.status}: ${text}`);
+        console.log(`[${nowIso()}] Webhook failed ${attempt}/${WEBHOOK_RETRIES}: ${lastError.message}`);
+        await sleep(500 * attempt);
+        continue;
+      }
+
+      console.log(`[${nowIso()}] Webhook ok (${data.type})`);
+      return true;
+    } catch (err) {
+      lastError = err;
+      console.log(`[${nowIso()}] Webhook error ${attempt}/${WEBHOOK_RETRIES}: ${err.message}`);
+      await sleep(500 * attempt);
+    }
   }
+
+  console.log(`[${nowIso()}] Webhook permanently failed (${data.type}): ${lastError ? lastError.message : 'Unknown error'}`);
+  return false;
 }
 
 function formatDuration(startMs, endMs) {
@@ -42,27 +77,12 @@ function formatDuration(startMs, endMs) {
   return `${minutes}m`;
 }
 
-function getDisplayStatus(event) {
-  const discordStatus = Number(event.status || 0);
-  const now = Date.now();
-  const startMs = event.scheduledStartTimestamp || null;
-  const endMs = event.scheduledEndTimestamp || null;
-
-  // Discord-cancelled should always stay cancelled
-  if (discordStatus === 4) return 'Cancelled';
-
-  // If Discord explicitly says completed, trust it
-  if (discordStatus === 3) return 'Done';
-
-  // Time-based fallback for better sheet display
-  if (startMs && now < startMs) return 'Not Started';
-  if (endMs && now >= endMs) return 'Done';
-  if (startMs && now >= startMs) return 'Started';
-
-  // Last fallback to Discord status if no useful times exist
-  switch (discordStatus) {
+function mapDiscordStatus(eventStatus) {
+  switch (Number(eventStatus || 0)) {
     case 1: return 'Not Started';
     case 2: return 'Started';
+    case 3: return 'Done';
+    case 4: return 'Cancelled';
     default: return 'Unknown';
   }
 }
@@ -78,7 +98,7 @@ function buildEventPayload(event, interestedCount) {
     startTime: startMs || '',
     endTime: endMs || '',
     duration: formatDuration(startMs, endMs),
-    status: getDisplayStatus(event),
+    status: mapDiscordStatus(event.status),
     channelId: event.channelId || '',
     interestedCount: uniqueInterested,
     uniqueInterested: uniqueInterested,
@@ -121,69 +141,126 @@ async function getInterestedCount(event) {
     const subscribers = await fetchAllSubscribers(event);
     return subscribers.length;
   } catch (err) {
-    console.log(`Could not fetch subscribers for ${event.name}:`, err.message);
+    console.log(`[${nowIso()}] Could not fetch subscribers for ${event.name}: ${err.message}`);
     return 0;
   }
 }
 
-async function syncExistingEventsAndUsers() {
+async function resolveDisplayName(guild, userId, fallbackUsername) {
+  try {
+    const member = await guild.members.fetch(userId);
+    return member ? member.displayName : fallbackUsername;
+  } catch {
+    return fallbackUsername;
+  }
+}
+
+function dedupeUsersByName(users) {
+  const seen = new Set();
+  const output = [];
+
+  for (const u of users) {
+    const username = String(u.username || '').trim();
+    if (!username) continue;
+
+    const key = username.toLowerCase();
+    if (seen.has(key)) continue;
+
+    seen.add(key);
+    output.push({ username });
+  }
+
+  return output;
+}
+
+async function syncSingleEvent(guild, event) {
+  const subscribers = await fetchAllSubscribers(event);
+  const interestedCount =
+    typeof event.userCount === 'number'
+      ? event.userCount
+      : subscribers.length;
+
+  await sendWebhook({
+    type: 'sync_event',
+    event: buildEventPayload(event, interestedCount)
+  });
+
+  const users = [];
+  for (const subscriber of subscribers) {
+    const fallback = subscriber.user?.username || '';
+    const displayName = await resolveDisplayName(guild, subscriber.user.id, fallback);
+    users.push({ username: displayName });
+  }
+
+  await sendWebhook({
+    type: 'sync_interest_snapshot',
+    eventId: event.id,
+    eventName: event.name,
+    users: dedupeUsersByName(users)
+  });
+
+  console.log(`[${nowIso()}] Synced event: ${event.name} (${interestedCount} interested)`);
+}
+
+async function syncExistingEventsAndUsers(reason = 'manual') {
+  console.log(`[${nowIso()}] Event sync started (${reason})`);
+
   try {
     const guild = await client.guilds.fetch(GUILD_ID);
     const events = await guild.scheduledEvents.fetch({ withUserCount: true });
 
-    console.log(`Startup sync: found ${events.size} scheduled event(s)`);
+    console.log(`[${nowIso()}] Found ${events.size} scheduled event(s)`);
 
     for (const [, event] of events) {
-      const subscribers = await fetchAllSubscribers(event);
-      const interestedCount =
-        typeof event.userCount === 'number'
-          ? event.userCount
-          : subscribers.length;
-
-      await sendWebhook({
-        type: 'sync_event',
-        event: buildEventPayload(event, interestedCount)
-      });
-
-      const users = [];
-
-      for (const subscriber of subscribers) {
-        const member = await guild.members
-          .fetch(subscriber.user.id)
-          .catch(() => null);
-
-        const displayName = member
-          ? member.displayName
-          : subscriber.user?.username || '';
-
-        users.push({
-          username: displayName
-        });
-      }
-
-      await sendWebhook({
-        type: 'sync_interest_snapshot',
-        eventId: event.id,
-        eventName: event.name,
-        users
-      });
-
-      console.log(`Synced event: ${event.name} (${interestedCount} interested)`);
+      await syncSingleEvent(guild, event);
     }
+
+    console.log(`[${nowIso()}] Event sync finished (${reason})`);
   } catch (err) {
-    console.log('Startup sync failed:', err);
+    console.log(`[${nowIso()}] Event sync failed (${reason}): ${err.message}`);
+  }
+}
+
+async function syncGuildMembers(reason = 'manual') {
+  console.log(`[${nowIso()}] Member sync started (${reason})`);
+
+  try {
+    const guild = await client.guilds.fetch(GUILD_ID);
+    const members = await guild.members.fetch();
+
+    const payload = [];
+    members.forEach(member => {
+      payload.push({
+        discordId: member.id,
+        displayName: member.displayName,
+        username: member.user?.username || ''
+      });
+    });
+
+    await sendWebhook({
+      type: 'member_snapshot',
+      members: payload
+    });
+
+    console.log(`[${nowIso()}] Synced ${payload.length} guild members`);
+  } catch (err) {
+    console.log(`[${nowIso()}] Member sync failed (${reason}): ${err.message}`);
   }
 }
 
 client.once(Events.ClientReady, async () => {
-  console.log(`Bot ready: ${client.user.tag}`);
+  console.log(`[${nowIso()}] Bot ready: ${client.user.tag}`);
 
-  await syncExistingEventsAndUsers();
+  await syncExistingEventsAndUsers('startup');
+  await syncGuildMembers('startup');
 
   setInterval(async () => {
-    console.log('Running scheduled sync...');
-    await syncExistingEventsAndUsers();
-  }, 15 * 60 * 1000);
+    await syncExistingEventsAndUsers('interval');
+  }, EVENT_SYNC_INTERVAL_MS);
+
+  setInterval(async () => {
+    await syncGuildMembers('interval');
+  }, MEMBER_SYNC_INTERVAL_MS);
 });
 
 client.on('guildScheduledEventCreate', async (event) => {
@@ -216,10 +293,7 @@ client.on('guildScheduledEventUpdate', async (_oldEvent, event) => {
     eventName: event.name,
     users: await Promise.all(
       subscribers.map(async (subscriber) => {
-        const member = await guild.members
-          .fetch(subscriber.user.id)
-          .catch(() => null);
-
+        const member = await guild.members.fetch(subscriber.user.id).catch(() => null);
         return {
           username: member ? member.displayName : (subscriber.user?.username || '')
         };
@@ -228,12 +302,32 @@ client.on('guildScheduledEventUpdate', async (_oldEvent, event) => {
   });
 });
 
+client.on('guildScheduledEventDelete', async (event) => {
+  if (event.guildId !== GUILD_ID) return;
+
+  const payload = buildEventPayload(event, 0);
+  payload.status = 'Cancelled';
+
+  await sendWebhook({
+    type: 'event_update',
+    event: payload
+  });
+
+  await sendWebhook({
+    type: 'sync_interest_snapshot',
+    eventId: event.id,
+    eventName: event.name,
+    users: []
+  });
+
+  console.log(`[${nowIso()}] Event cancelled/deleted: ${event.name}`);
+});
+
 client.on('guildScheduledEventUserAdd', async (event, user) => {
   if (event.guildId !== GUILD_ID) return;
 
   const guild = await client.guilds.fetch(GUILD_ID);
-  const member = await guild.members.fetch(user.id).catch(() => null);
-  const displayName = member ? member.displayName : user.username;
+  const displayName = await resolveDisplayName(guild, user.id, user.username);
 
   await sendWebhook({
     type: 'interest_add',
@@ -254,8 +348,7 @@ client.on('guildScheduledEventUserRemove', async (event, user) => {
   if (event.guildId !== GUILD_ID) return;
 
   const guild = await client.guilds.fetch(GUILD_ID);
-  const member = await guild.members.fetch(user.id).catch(() => null);
-  const displayName = member ? member.displayName : user.username;
+  const displayName = await resolveDisplayName(guild, user.id, user.username);
 
   await sendWebhook({
     type: 'interest_remove',
@@ -270,6 +363,18 @@ client.on('guildScheduledEventUserRemove', async (event, user) => {
     type: 'event_update',
     event: buildEventPayload(event, interestedCount)
   });
+});
+
+process.on('SIGTERM', () => {
+  console.log(`[${nowIso()}] SIGTERM received, shutting down.`);
+  client.destroy();
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  console.log(`[${nowIso()}] SIGINT received, shutting down.`);
+  client.destroy();
+  process.exit(0);
 });
 
 client.login(TOKEN);
