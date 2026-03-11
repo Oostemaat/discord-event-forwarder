@@ -271,12 +271,27 @@ function dedupeUsersByName(users) {
 
 async function syncSingleEvent(guild, event) {
   const subscribers = await fetchAllSubscribers(event);
+
   const interestedCount =
     typeof event.userCount === 'number'
       ? event.userCount
       : subscribers.length;
 
   const payload = buildEventPayload(event, interestedCount);
+
+  const now = Date.now();
+  const startMs = safeDateMs(event.scheduledStartTimestamp);
+  const endMs = safeDateMs(event.scheduledEndTimestamp);
+
+  if (endMs && now >= endMs) {
+    payload.status = 'Done';
+    payload.rawStatusCode = 3;
+    payload.statusSource = 'bot_time_finished';
+  } else if (startMs && now >= startMs) {
+    payload.status = 'Started';
+    payload.rawStatusCode = 2;
+    payload.statusSource = 'bot_time_started';
+  }
 
   await sendWebhook({
     type: 'sync_event',
@@ -301,8 +316,7 @@ async function syncSingleEvent(guild, event) {
 
   console.log(`[${nowIso()}] Synced event: ${event.name} (${interestedCount} interested)`);
 }
-
-async function sendFinalDoneForMissingEvents(liveEventIds) {
+async function finaliseMissingEvents(liveEventIds) {
   const store = readEventStore();
   const now = Date.now();
 
@@ -312,33 +326,45 @@ async function sendFinalDoneForMissingEvents(liveEventIds) {
     if (liveEventIds.has(eventId)) continue;
     if (stored.finalised === true) continue;
 
-    const endMs = stored.endTime ? new Date(stored.endTime).getTime() : 0;
     const startMs = stored.startTime ? new Date(stored.startTime).getTime() : 0;
+    const endMs = stored.endTime ? new Date(stored.endTime).getTime() : 0;
+
+    let finalStatus = '';
+    let rawStatusCode = 0;
+    let statusSource = '';
 
     if (endMs && now >= endMs) {
-      const payload = {
-        id: stored.id,
-        name: stored.name || '',
-        startTime: stored.startTime || '',
-        endTime: stored.endTime || '',
-        duration: stored.duration || formatDuration(startMs, endMs),
-        status: 'Done',
-        rawStatusCode: 3,
-        statusSource: 'bot_missing_finished',
-        channelId: stored.channelId || '',
-        interestedCount: Number(stored.interestedCount || 0),
-        uniqueInterested: Number(stored.uniqueInterested || 0),
-        url: stored.url || `https://discord.com/events/${GUILD_ID}/${stored.id}`
-      };
-
-      await sendWebhook({
-        type: 'event_update',
-        event: payload
-      });
-
-      markStoredEventStatus(eventId, 'Done', 3, 'bot_missing_finished');
-      console.log(`[${nowIso()}] Finalised missing event as Done: ${stored.name} (${stored.id})`);
+      finalStatus = 'Done';
+      rawStatusCode = 3;
+      statusSource = 'bot_missing_finished';
+    } else {
+      finalStatus = 'Cancelled';
+      rawStatusCode = 4;
+      statusSource = 'bot_missing_cancelled';
     }
+
+    const payload = {
+      id: stored.id,
+      name: stored.name || '',
+      startTime: stored.startTime || '',
+      endTime: stored.endTime || '',
+      duration: stored.duration || formatDuration(startMs, endMs),
+      status: finalStatus,
+      rawStatusCode: rawStatusCode,
+      statusSource: statusSource,
+      channelId: stored.channelId || '',
+      interestedCount: Number(stored.interestedCount || 0),
+      uniqueInterested: Number(stored.uniqueInterested || 0),
+      url: stored.url || `https://discord.com/events/${GUILD_ID}/${stored.id}`
+    };
+
+    await sendWebhook({
+      type: 'event_update',
+      event: payload
+    });
+
+    markStoredEventStatus(eventId, finalStatus, rawStatusCode, statusSource);
+    console.log(`[${nowIso()}] Finalised missing event as ${finalStatus}: ${stored.name} (${stored.id})`);
   }
 }
 
@@ -358,7 +384,7 @@ async function syncExistingEventsAndUsers(reason = 'manual') {
       await syncSingleEvent(guild, event);
     }
 
-    await sendFinalDoneForMissingEvents(liveEventIds);
+    await finaliseMissingEvents(liveEventIds);
     pruneOldStoredEvents();
 
     console.log(`[${nowIso()}] Event sync finished (${reason})`);
