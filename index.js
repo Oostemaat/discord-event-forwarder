@@ -15,11 +15,13 @@ const WEBHOOK_RETRIES = Number(process.env.WEBHOOK_RETRIES || 3);
 const EVENT_RETENTION_DAYS = Number(process.env.EVENT_RETENTION_DAYS || 30);
 
 const EVENT_STORE_FILE = path.join(__dirname, 'event-store.json');
+const ATTENDANCE_STORE_FILE = path.join(__dirname, 'attendance-store.json');
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildVoiceStates
   ]
 });
 
@@ -202,6 +204,143 @@ function pruneOldStoredEvents() {
   writeEventStore(store);
 }
 
+function readAttendanceStore() {
+  try {
+    if (!fs.existsSync(ATTENDANCE_STORE_FILE)) return {};
+    const raw = fs.readFileSync(ATTENDANCE_STORE_FILE, 'utf8');
+    return raw ? JSON.parse(raw) : {};
+  } catch (err) {
+    console.log(`[${nowIso()}] Failed reading attendance store: ${err.message}`);
+    return {};
+  }
+}
+
+function writeAttendanceStore(store) {
+  try {
+    fs.writeFileSync(ATTENDANCE_STORE_FILE, JSON.stringify(store, null, 2), 'utf8');
+  } catch (err) {
+    console.log(`[${nowIso()}] Failed writing attendance store: ${err.message}`);
+  }
+}
+
+function ensureAttendanceEvent(eventPayload) {
+  if (!eventPayload || !eventPayload.id) return;
+
+  const store = readAttendanceStore();
+  const existing = store[eventPayload.id] || {};
+
+  store[eventPayload.id] = {
+    eventId: eventPayload.id,
+    eventName: eventPayload.name || existing.eventName || '',
+    channelId: eventPayload.channelId || existing.channelId || '',
+    startTime: eventPayload.startTime || existing.startTime || '',
+    endTime: eventPayload.endTime || existing.endTime || '',
+    status: eventPayload.status || existing.status || '',
+    joinedUsers: existing.joinedUsers || {},
+    currentUsers: existing.currentUsers || {},
+    finalised: existing.finalised === true
+  };
+
+  writeAttendanceStore(store);
+}
+
+function updateAttendanceEventStatus(eventPayload) {
+  if (!eventPayload || !eventPayload.id) return;
+
+  const store = readAttendanceStore();
+  const existing = store[eventPayload.id];
+  if (!existing) {
+    ensureAttendanceEvent(eventPayload);
+    return;
+  }
+
+  existing.eventName = eventPayload.name || existing.eventName || '';
+  existing.channelId = eventPayload.channelId || existing.channelId || '';
+  existing.startTime = eventPayload.startTime || existing.startTime || '';
+  existing.endTime = eventPayload.endTime || existing.endTime || '';
+  existing.status = eventPayload.status || existing.status || '';
+
+  store[eventPayload.id] = existing;
+  writeAttendanceStore(store);
+}
+
+function isEventStartedByTime(att) {
+  const now = Date.now();
+  const startMs = att.startTime ? new Date(att.startTime).getTime() : 0;
+  const endMs = att.endTime ? new Date(att.endTime).getTime() : 0;
+
+  if (endMs && now >= endMs) return false;
+  if (startMs && now >= startMs) return true;
+  return att.status === 'Started';
+}
+
+function addAttendanceUser(eventId, userId, username) {
+  const store = readAttendanceStore();
+  const att = store[eventId];
+  if (!att) return;
+
+  att.joinedUsers = att.joinedUsers || {};
+  att.currentUsers = att.currentUsers || {};
+
+  att.joinedUsers[userId] = {
+    username: username || att.joinedUsers[userId]?.username || '',
+    firstSeenAt: att.joinedUsers[userId]?.firstSeenAt || nowIso(),
+    lastSeenAt: nowIso()
+  };
+
+  att.currentUsers[userId] = true;
+  store[eventId] = att;
+  writeAttendanceStore(store);
+}
+
+function removeAttendanceUser(eventId, userId) {
+  const store = readAttendanceStore();
+  const att = store[eventId];
+  if (!att) return;
+
+  att.currentUsers = att.currentUsers || {};
+  delete att.currentUsers[userId];
+
+  if (att.joinedUsers && att.joinedUsers[userId]) {
+    att.joinedUsers[userId].lastSeenAt = nowIso();
+  }
+
+  store[eventId] = att;
+  writeAttendanceStore(store);
+}
+
+function getTrackedEventsByChannel(channelId) {
+  const store = readAttendanceStore();
+  return Object.values(store).filter(att =>
+    String(att.channelId || '') === String(channelId || '') &&
+    att.finalised !== true &&
+    isEventStartedByTime(att)
+  );
+}
+
+async function sendAttendanceSnapshot(eventId) {
+  const store = readAttendanceStore();
+  const att = store[eventId];
+  if (!att || att.finalised === true) return;
+
+  const users = Object.values(att.joinedUsers || {})
+    .map(u => ({ username: u.username || '' }))
+    .filter(u => u.username);
+
+  await sendWebhook({
+    type: 'attendance_snapshot',
+    eventId: att.eventId,
+    eventName: att.eventName,
+    users
+  });
+
+  att.finalised = true;
+  store[eventId] = att;
+  writeAttendanceStore(store);
+
+  console.log(`[${nowIso()}] Sent attendance snapshot for ${att.eventName}: ${users.length} unique attendees`);
+}
+
 async function fetchAllSubscribers(event) {
   const subscribers = [];
   let lastId = null;
@@ -299,8 +438,11 @@ async function syncSingleEvent(guild, event) {
   });
 
   upsertStoredEvent(payload);
+  ensureAttendanceEvent(payload);
+  updateAttendanceEventStatus(payload);
 
   const users = [];
+
   for (const subscriber of subscribers) {
     const fallback = subscriber.user?.username || '';
     const displayName = await resolveDisplayName(guild, subscriber.user.id, fallback);
@@ -316,6 +458,7 @@ async function syncSingleEvent(guild, event) {
 
   console.log(`[${nowIso()}] Synced event: ${event.name} (${interestedCount} interested)`);
 }
+
 async function finaliseMissingEvents(liveEventIds) {
   const store = readEventStore();
   const now = Date.now();
@@ -350,8 +493,8 @@ async function finaliseMissingEvents(liveEventIds) {
       endTime: stored.endTime || '',
       duration: stored.duration || formatDuration(startMs, endMs),
       status: finalStatus,
-      rawStatusCode: rawStatusCode,
-      statusSource: statusSource,
+      rawStatusCode,
+      statusSource,
       channelId: stored.channelId || '',
       interestedCount: Number(stored.interestedCount || 0),
       uniqueInterested: Number(stored.uniqueInterested || 0),
@@ -364,6 +507,9 @@ async function finaliseMissingEvents(liveEventIds) {
     });
 
     markStoredEventStatus(eventId, finalStatus, rawStatusCode, statusSource);
+    updateAttendanceEventStatus(payload);
+    await sendAttendanceSnapshot(eventId);
+
     console.log(`[${nowIso()}] Finalised missing event as ${finalStatus}: ${stored.name} (${stored.id})`);
   }
 }
@@ -448,6 +594,8 @@ client.on('guildScheduledEventCreate', async (event) => {
   });
 
   upsertStoredEvent(payload);
+  ensureAttendanceEvent(payload);
+  updateAttendanceEventStatus(payload);
 });
 
 client.on('guildScheduledEventUpdate', async (_oldEvent, event) => {
@@ -462,6 +610,8 @@ client.on('guildScheduledEventUpdate', async (_oldEvent, event) => {
   });
 
   upsertStoredEvent(payload);
+  ensureAttendanceEvent(payload);
+  updateAttendanceEventStatus(payload);
 
   const subscribers = await fetchAllSubscribers(event);
   const guild = await client.guilds.fetch(GUILD_ID);
@@ -506,6 +656,8 @@ client.on('guildScheduledEventDelete', async (event) => {
 
   upsertStoredEvent(payload);
   markStoredEventStatus(event.id, payload.status, payload.rawStatusCode, payload.statusSource);
+  ensureAttendanceEvent(payload);
+  updateAttendanceEventStatus(payload);
 
   await sendWebhook({
     type: 'sync_interest_snapshot',
@@ -513,6 +665,8 @@ client.on('guildScheduledEventDelete', async (event) => {
     eventName: event.name,
     users: []
   });
+
+  await sendAttendanceSnapshot(event.id);
 
   console.log(`[${nowIso()}] Event removed: ${event.name} -> ${payload.status}`);
 });
@@ -539,6 +693,8 @@ client.on('guildScheduledEventUserAdd', async (event, user) => {
   });
 
   upsertStoredEvent(payload);
+  ensureAttendanceEvent(payload);
+  updateAttendanceEventStatus(payload);
 });
 
 client.on('guildScheduledEventUserRemove', async (event, user) => {
@@ -563,6 +719,37 @@ client.on('guildScheduledEventUserRemove', async (event, user) => {
   });
 
   upsertStoredEvent(payload);
+  ensureAttendanceEvent(payload);
+  updateAttendanceEventStatus(payload);
+});
+
+client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
+  try {
+    const member = newState.member || oldState.member;
+    const userId = member?.id;
+    const username = member?.displayName || member?.user?.username || '';
+
+    const oldChannelId = oldState.channelId;
+    const newChannelId = newState.channelId;
+
+    if (!userId) return;
+
+    if (oldChannelId && oldChannelId !== newChannelId) {
+      const leavingEvents = getTrackedEventsByChannel(oldChannelId);
+      for (const att of leavingEvents) {
+        removeAttendanceUser(att.eventId, userId);
+      }
+    }
+
+    if (newChannelId) {
+      const joiningEvents = getTrackedEventsByChannel(newChannelId);
+      for (const att of joiningEvents) {
+        addAttendanceUser(att.eventId, userId, username);
+      }
+    }
+  } catch (err) {
+    console.log(`[${nowIso()}] VoiceStateUpdate attendance error: ${err.message}`);
+  }
 });
 
 process.on('SIGTERM', () => {
