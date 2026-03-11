@@ -1,7 +1,7 @@
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
-const { Client, GatewayIntentBits, Events } = require('discord.js');
+const { Client, GatewayIntentBits, Events, ChannelType } = require('discord.js');
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 
 const TOKEN = process.env.DISCORD_TOKEN;
@@ -124,6 +124,10 @@ function buildEventPayload(event, interestedCount) {
   };
 }
 
+/* =========================
+   EVENT STORE
+========================= */
+
 function readEventStore() {
   try {
     if (!fs.existsSync(EVENT_STORE_FILE)) return {};
@@ -203,6 +207,10 @@ function pruneOldStoredEvents() {
 
   writeEventStore(store);
 }
+
+/* =========================
+   ATTENDANCE STORE
+========================= */
 
 function readAttendanceStore() {
   try {
@@ -299,12 +307,36 @@ function removeAttendanceUser(eventId, userId) {
   writeAttendanceStore(store);
 }
 
-function getTrackedEventsByChannel(channelId) {
+function isAttendanceEventLive(att) {
+  const now = Date.now();
+  const startMs = att.startTime ? new Date(att.startTime).getTime() : 0;
+  const endMs = att.endTime ? new Date(att.endTime).getTime() : 0;
+  const status = String(att.status || '').trim();
+
+  if (att.finalised === true) return false;
+  if (status === 'Cancelled' || status === 'Done') return false;
+  if (endMs && now >= endMs) return false;
+
+  return (startMs && now >= startMs) || status === 'Started';
+}
+
+function getTrackedEventByChannel(channelId) {
   const store = readAttendanceStore();
-  return Object.values(store).filter(att =>
+
+  const liveEvents = Object.values(store).filter(att =>
     String(att.channelId || '') === String(channelId || '') &&
-    att.finalised !== true
+    isAttendanceEventLive(att)
   );
+
+  if (!liveEvents.length) return null;
+
+  liveEvents.sort((a, b) => {
+    const aStart = a.startTime ? new Date(a.startTime).getTime() : 0;
+    const bStart = b.startTime ? new Date(b.startTime).getTime() : 0;
+    return bStart - aStart;
+  });
+
+  return liveEvents[0];
 }
 
 async function sendLiveAttendanceSnapshot(eventId) {
@@ -352,9 +384,41 @@ async function sendAttendanceSnapshot(eventId) {
 async function captureCurrentVoiceMembersForEvent(guild, eventPayload) {
   if (!eventPayload || !eventPayload.id || !eventPayload.channelId) return;
 
+  const now = Date.now();
+  const startMs = safeDateMs(eventPayload.startTime);
+  const endMs = safeDateMs(eventPayload.endTime);
+  const status = String(eventPayload.status || '').trim();
+
+  const isLive =
+    status === 'Started' ||
+    (startMs && now >= startMs && (!endMs || now < endMs));
+
+  if (!isLive) return;
+
+  const activeEventForChannel = getTrackedEventByChannel(eventPayload.channelId);
+  if (activeEventForChannel && activeEventForChannel.eventId !== eventPayload.id) return;
+
   try {
     const channel = await guild.channels.fetch(eventPayload.channelId).catch(() => null);
-    if (!channel || !channel.members) return;
+    if (!channel) return;
+
+    const isVoiceLike =
+      channel.type === ChannelType.GuildVoice ||
+      channel.type === ChannelType.GuildStageVoice;
+
+    if (!isVoiceLike || !channel.members) return;
+
+    const store = readAttendanceStore();
+    const att = store[eventPayload.id];
+    if (!att) return;
+
+    const currentIds = new Set(channel.members.map(m => m.id));
+
+    Object.keys(att.currentUsers || {}).forEach(userId => {
+      if (!currentIds.has(userId)) {
+        removeAttendanceUser(eventPayload.id, userId);
+      }
+    });
 
     channel.members.forEach(member => {
       addAttendanceUser(
@@ -365,11 +429,15 @@ async function captureCurrentVoiceMembersForEvent(guild, eventPayload) {
     });
 
     await sendLiveAttendanceSnapshot(eventPayload.id);
-    console.log(`[${nowIso()}] Captured current voice members for ${eventPayload.name}: ${channel.members.size}`);
+    console.log(`[${nowIso()}] Captured current voice members for LIVE event ${eventPayload.name}: ${channel.members.size}`);
   } catch (err) {
     console.log(`[${nowIso()}] Failed capturing voice members for ${eventPayload.name}: ${err.message}`);
   }
 }
+
+/* =========================
+   DISCORD EVENT HELPERS
+========================= */
 
 async function fetchAllSubscribers(event) {
   const subscribers = [];
@@ -437,6 +505,10 @@ function dedupeUsersByName(users) {
 
   return output;
 }
+
+/* =========================
+   SYNC
+========================= */
 
 async function syncSingleEvent(guild, event) {
   const subscribers = await fetchAllSubscribers(event);
@@ -601,6 +673,10 @@ async function syncGuildMembers(reason = 'manual') {
     console.log(`[${nowIso()}] Member sync failed (${reason}): ${err.message}`);
   }
 }
+
+/* =========================
+   CLIENT EVENTS
+========================= */
 
 client.once(Events.ClientReady, async () => {
   console.log(`[${nowIso()}] Bot ready: ${client.user.tag}`);
@@ -776,18 +852,18 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
     if (!userId) return;
 
     if (oldChannelId && oldChannelId !== newChannelId) {
-      const leavingEvents = getTrackedEventsByChannel(oldChannelId);
-      for (const att of leavingEvents) {
-        removeAttendanceUser(att.eventId, userId);
-        await sendLiveAttendanceSnapshot(att.eventId);
+      const oldEvent = getTrackedEventByChannel(oldChannelId);
+      if (oldEvent) {
+        removeAttendanceUser(oldEvent.eventId, userId);
+        await sendLiveAttendanceSnapshot(oldEvent.eventId);
       }
     }
 
     if (newChannelId) {
-      const joiningEvents = getTrackedEventsByChannel(newChannelId);
-      for (const att of joiningEvents) {
-        addAttendanceUser(att.eventId, userId, username);
-        await sendLiveAttendanceSnapshot(att.eventId);
+      const newEvent = getTrackedEventByChannel(newChannelId);
+      if (newEvent) {
+        addAttendanceUser(newEvent.eventId, userId, username);
+        await sendLiveAttendanceSnapshot(newEvent.eventId);
       }
     }
   } catch (err) {
