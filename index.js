@@ -766,12 +766,32 @@ function getDesiredLadderRoleId(row) {
     guest: 'Guest'
   };
 
+  const excludedRanks = new Set([
+    'Owner',
+    'Deputy_owner',
+    'General',
+    'Champion'
+  ]);
+
   const canonicalRank = rankAliases[rawRank] || rawRank;
+
+  if (excludedRanks.has(canonicalRank)) {
+    return '';
+  }
+
   return LADDER_ROLE_MAP[canonicalRank] || '';
 }
-
 function getAllManagedLadderRoleIds() {
-  return [...new Set(Object.values(LADDER_ROLE_MAP).filter(Boolean))];
+  const excludedRoleIds = new Set([
+    '1178145449165725706', // Owner / Deputy_owner
+    '1269265842433036298'  // General / Champion
+  ]);
+
+  return [...new Set(
+    Object.values(LADDER_ROLE_MAP)
+      .filter(Boolean)
+      .filter(roleId => !excludedRoleIds.has(roleId))
+  )];
 }
 
 async function syncMemberRolesFromRow(guild, row) {
