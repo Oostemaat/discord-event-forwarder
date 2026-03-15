@@ -1,7 +1,16 @@
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
-const { Client, GatewayIntentBits, Events, ChannelType } = require('discord.js');
+const {
+  Client,
+  GatewayIntentBits,
+  Events,
+  ChannelType,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  PermissionFlagsBits
+} = require('discord.js');
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 
 const TOKEN = process.env.DISCORD_TOKEN;
@@ -55,6 +64,36 @@ const client = new Client({
   ]
 });
 
+const slashCommands = [
+  new SlashCommandBuilder()
+    .setName('setuprsn')
+    .setDescription('Map a Discord user to an RSN and approve them')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addUserOption(option =>
+      option
+        .setName('user')
+        .setDescription('Discord user to map')
+        .setRequired(true)
+    )
+    .addStringOption(option =>
+      option
+        .setName('rsn')
+        .setDescription('RuneScape name')
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('removersn')
+    .setDescription('Remove a Discord user RSN mapping')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addUserOption(option =>
+      option
+        .setName('user')
+        .setDescription('Discord user to remove mapping for')
+        .setRequired(true)
+    )
+].map(cmd => cmd.toJSON());
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -66,6 +105,37 @@ function nowIso() {
 function safeDateMs(value) {
   const n = Number(value || 0);
   return Number.isFinite(n) ? n : 0;
+}
+
+function cleanRsn(value) {
+  return String(value || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function registerSlashCommands() {
+  try {
+    if (!client.application) {
+      await client.application?.fetch();
+    }
+
+    const applicationId = client.application?.id;
+    if (!applicationId) {
+      console.log(`[${nowIso()}] Could not determine application ID, skipping slash command registration.`);
+      return;
+    }
+
+    const rest = new REST({ version: '10' }).setToken(TOKEN);
+
+    await rest.put(
+      Routes.applicationGuildCommands(applicationId, GUILD_ID),
+      { body: slashCommands }
+    );
+
+    console.log(`[${nowIso()}] Slash commands registered for guild ${GUILD_ID}`);
+  } catch (err) {
+    console.log(`[${nowIso()}] Failed to register slash commands: ${err.message}`);
+  }
 }
 
 async function sendWebhook(data) {
@@ -94,7 +164,7 @@ async function sendWebhook(data) {
         continue;
       }
 
-      console.log(`[${nowIso()}] Webhook ok (${data.type})`);
+      console.log(`[${nowIso()}] Webhook ok (${data.type || data.action || 'unknown'})`);
       return true;
     } catch (err) {
       lastError = err;
@@ -103,8 +173,47 @@ async function sendWebhook(data) {
     }
   }
 
-  console.log(`[${nowIso()}] Webhook permanently failed (${data.type}): ${lastError ? lastError.message : 'Unknown error'}`);
+  console.log(`[${nowIso()}] Webhook permanently failed (${data.type || data.action || 'unknown'}): ${lastError ? lastError.message : 'Unknown error'}`);
   return false;
+}
+
+async function sendWebhookJson(data) {
+  try {
+    const res = await fetch(WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        secret: SECRET,
+        ...data
+      })
+    });
+
+    const text = await res.text();
+
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = {
+        ok: false,
+        error: text || `Non-JSON response (HTTP ${res.status})`
+      };
+    }
+
+    if (!res.ok && parsed.ok !== true) {
+      return {
+        ok: false,
+        error: parsed.error || `HTTP ${res.status}`
+      };
+    }
+
+    return parsed;
+  } catch (err) {
+    return {
+      ok: false,
+      error: err.message
+    };
+  }
 }
 
 function formatDuration(startMs, endMs) {
@@ -763,6 +872,112 @@ async function syncRolesFromSheet(reason = 'manual') {
 }
 
 /* =========================
+   COMMANDS
+========================= */
+
+async function handleSetupRsnCommand(interaction) {
+  await interaction.deferReply({ ephemeral: true });
+
+  try {
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      await interaction.editReply('❌ You do not have permission to use this command.');
+      return;
+    }
+
+    const targetUser = interaction.options.getUser('user', true);
+    const rsn = cleanRsn(interaction.options.getString('rsn', true));
+    const guild = interaction.guild;
+
+    if (!rsn) {
+      await interaction.editReply('❌ RSN cannot be empty.');
+      return;
+    }
+
+    const member = await guild.members.fetch(targetUser.id).catch(() => null);
+
+    const payload = {
+      action: 'setup_rsn',
+      guildId: guild.id,
+      guildName: guild.name,
+      discordUserId: targetUser.id,
+      discordTag: targetUser.tag,
+      discordUsername: targetUser.username,
+      displayName: member?.displayName || targetUser.globalName || targetUser.username,
+      rsn,
+      approvedById: interaction.user.id,
+      approvedByTag: interaction.user.tag,
+      approvedAt: new Date().toISOString()
+    };
+
+    const data = await sendWebhookJson(payload);
+
+    if (!data.ok) {
+      await interaction.editReply(`❌ Failed to set up RSN: ${data.error || 'Unknown error'}`);
+      return;
+    }
+
+    let msg = '';
+    msg += `✅ RSN mapping saved and approved.\n`;
+    msg += `User: <@${targetUser.id}>\n`;
+    msg += `RSN: **${rsn}**\n`;
+    msg += `Map row: ${data.updated ? 'updated' : 'created'}\n`;
+    msg += `Unmapped row: ${data.removedFromUnmapped ? 'removed' : 'no match found'}\n`;
+    msg += `Role sync: ${data.syncTriggered ? 'triggered' : 'not triggered'}`;
+
+    await interaction.editReply(msg);
+  } catch (err) {
+    console.log(`[${nowIso()}] setuprsn error: ${err.message}`);
+    await interaction.editReply(`❌ Error running setuprsn: ${err.message}`);
+  }
+}
+
+async function handleRemoveRsnCommand(interaction) {
+  await interaction.deferReply({ ephemeral: true });
+
+  try {
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      await interaction.editReply('❌ You do not have permission to use this command.');
+      return;
+    }
+
+    const targetUser = interaction.options.getUser('user', true);
+    const guild = interaction.guild;
+    const member = await guild.members.fetch(targetUser.id).catch(() => null);
+
+    const payload = {
+      action: 'remove_rsn',
+      guildId: guild.id,
+      guildName: guild.name,
+      discordUserId: targetUser.id,
+      discordTag: targetUser.tag,
+      discordUsername: targetUser.username,
+      displayName: member?.displayName || targetUser.globalName || targetUser.username,
+      removedById: interaction.user.id,
+      removedByTag: interaction.user.tag,
+      removedAt: new Date().toISOString()
+    };
+
+    const data = await sendWebhookJson(payload);
+
+    if (!data.ok) {
+      await interaction.editReply(`❌ Failed to remove RSN: ${data.error || 'Unknown error'}`);
+      return;
+    }
+
+    let msg = '';
+    msg += `✅ RSN mapping removed.\n`;
+    msg += `User: <@${targetUser.id}>\n`;
+    msg += `Map row: ${data.found ? 'removed' : 'no existing mapping found'}\n`;
+    msg += `Role sync: ${data.syncTriggered ? 'triggered' : 'not triggered'}`;
+
+    await interaction.editReply(msg);
+  } catch (err) {
+    console.log(`[${nowIso()}] removersn error: ${err.message}`);
+    await interaction.editReply(`❌ Error running removersn: ${err.message}`);
+  }
+}
+
+/* =========================
    SYNC
 ========================= */
 
@@ -937,6 +1152,8 @@ async function syncGuildMembers(reason = 'manual') {
 client.once(Events.ClientReady, async () => {
   console.log(`[${nowIso()}] Bot ready: ${client.user.tag}`);
 
+  await registerSlashCommands();
+
   await syncExistingEventsAndUsers('startup');
   await syncGuildMembers('startup');
   await syncRolesFromSheet('startup');
@@ -952,6 +1169,21 @@ client.once(Events.ClientReady, async () => {
   setInterval(async () => {
     await syncRolesFromSheet('interval');
   }, ROLE_SYNC_INTERVAL_MS);
+});
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+  if (interaction.guildId !== GUILD_ID) return;
+
+  if (interaction.commandName === 'setuprsn') {
+    await handleSetupRsnCommand(interaction);
+    return;
+  }
+
+  if (interaction.commandName === 'removersn') {
+    await handleRemoveRsnCommand(interaction);
+    return;
+  }
 });
 
 client.on('guildScheduledEventCreate', async (event) => {
