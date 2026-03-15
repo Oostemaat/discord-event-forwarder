@@ -22,11 +22,6 @@ const SYNC_NICKNAME_TO_RSN = String(process.env.SYNC_NICKNAME_TO_RSN || 'false')
 const EVENT_STORE_FILE = path.join(__dirname, 'event-store.json');
 const ATTENDANCE_STORE_FILE = path.join(__dirname, 'attendance-store.json');
 
-/**
- * PROMOTION-SYSTEM LADDER ROLES ONLY
- * The bot only manages these roles.
- * Any other roles on members are left alone.
- */
 const LADDER_ROLE_MAP = {
   Owner: '1178145449165725706',
   Deputy_owner: '1178145449165725706',
@@ -587,9 +582,83 @@ async function fetchRoleSyncRows() {
 }
 
 function getDesiredLadderRoleId(row) {
-  const rank = String(row.rank || row.roleKey || '').trim();
-  if (!rank) return '';
-  return LADDER_ROLE_MAP[rank] || '';
+  const rawRank = String(row.rank || row.roleKey || '').trim();
+  if (!rawRank) return '';
+
+  const rankAliases = {
+    Owner: 'Owner',
+    owner: 'Owner',
+
+    Deputy_owner: 'Deputy_owner',
+    'Deputy Owner': 'Deputy_owner',
+    'deputy owner': 'Deputy_owner',
+    deputy_owner: 'Deputy_owner',
+
+    Administrator: 'Administrator',
+    administrator: 'Administrator',
+
+    General: 'General',
+    general: 'General',
+
+    Champion: 'Champion',
+    champion: 'Champion',
+
+    Templar: 'Templar',
+    templar: 'Templar',
+
+    Blood: 'Blood',
+    blood: 'Blood',
+
+    Carry: 'Carry',
+    carry: 'Carry',
+
+    Achiever: 'Achiever',
+    achiever: 'Achiever',
+
+    Gamer: 'Gamer',
+    gamer: 'Gamer',
+
+    Goblin: 'Goblin',
+    goblin: 'Goblin',
+
+    Merchant: 'Merchant',
+    merchant: 'Merchant',
+
+    Destroyer: 'Destroyer',
+    destroyer: 'Destroyer',
+
+    Unholy: 'Unholy',
+    unholy: 'Unholy',
+
+    Maxed: 'Maxed',
+    maxed: 'Maxed',
+
+    TzKal: 'TzKal',
+    tzkal: 'TzKal',
+
+    Quester: 'Quester',
+    quester: 'Quester',
+
+    Sergeant: 'Sergeant',
+    sergeant: 'Sergeant',
+
+    Corporal: 'Corporal',
+    corporal: 'Corporal',
+
+    Recruit: 'Recruit',
+    recruit: 'Recruit',
+
+    Bronze: 'Bronze',
+    bronze: 'Bronze',
+    'Bronze bar': 'Bronze',
+    'bronze bar': 'Bronze',
+
+    Guest: 'Guest',
+    guest: 'Guest'
+  };
+
+  const canonicalRank = rankAliases[rawRank] || rawRank;
+  return LADDER_ROLE_MAP[canonicalRank] || '';
 }
 
 function getAllManagedLadderRoleIds() {
@@ -613,10 +682,21 @@ async function syncMemberRolesFromRow(guild, row) {
     .filter(role => managedRoleIds.includes(role.id))
     .map(role => role.id);
 
+  if (!desiredRoleId) {
+    console.log(
+      `[${nowIso()}] No valid ladder role resolved for ${member.user.tag} | rsn="${rsn}" | rank="${String(row.rank || row.roleKey || '').trim()}"`
+    );
+    return {
+      ok: false,
+      reason: 'no_valid_desired_role',
+      discordId,
+      rsn,
+      rank: String(row.rank || row.roleKey || '').trim()
+    };
+  }
+
   const toRemove = currentManagedRoleIds.filter(roleId => roleId !== desiredRoleId);
-  const toAdd = desiredRoleId && !currentManagedRoleIds.includes(desiredRoleId)
-    ? [desiredRoleId]
-    : [];
+  const toAdd = currentManagedRoleIds.includes(desiredRoleId) ? [] : [desiredRoleId];
 
   for (const roleId of toRemove) {
     try {
