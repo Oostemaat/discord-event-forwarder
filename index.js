@@ -14,8 +14,43 @@ const MEMBER_SYNC_INTERVAL_MS = Number(process.env.MEMBER_SYNC_INTERVAL_MS || 6 
 const WEBHOOK_RETRIES = Number(process.env.WEBHOOK_RETRIES || 3);
 const EVENT_RETENTION_DAYS = Number(process.env.EVENT_RETENTION_DAYS || 30);
 
+const ROLE_SYNC_INTERVAL_MS = Number(process.env.ROLE_SYNC_INTERVAL_MS || 5 * 60 * 1000);
+const ROLE_SYNC_URL = process.env.ROLE_SYNC_URL;
+const ROLE_SYNC_SECRET = process.env.ROLE_SYNC_SECRET;
+const SYNC_NICKNAME_TO_RSN = String(process.env.SYNC_NICKNAME_TO_RSN || 'false').toLowerCase() === 'true';
+
 const EVENT_STORE_FILE = path.join(__dirname, 'event-store.json');
 const ATTENDANCE_STORE_FILE = path.join(__dirname, 'attendance-store.json');
+
+/**
+ * PROMOTION-SYSTEM LADDER ROLES ONLY
+ * The bot only manages these roles.
+ * Any other roles on members are left alone.
+ */
+const LADDER_ROLE_MAP = {
+  Owner: '1178145449165725706',
+  Deputy_owner: '1178145449165725706',
+  General: '1269265842433036298',
+  Champion: '1269265842433036298',
+  Templar: '1480269103410450596',
+  Blood: '1480264334650249350',
+  Carry: '1480268350721626264',
+  Achiever: '1480268970090299607',
+  Gamer: '1480263559224234196',
+  Administrator: '1178145449165725706',
+  Goblin: '1480264862880760049',
+  Merchant: '1480267841335857264',
+  Destroyer: '1480266664703430769',
+  Unholy: '1480266140159836241',
+  Maxed: '1480265333825867878',
+  TzKal: '1480267421674897498',
+  Quester: '1480268359772803184',
+  Sergeant: '1480263303375753360',
+  Corporal: '1480262992112390235',
+  Recruit: '1480252412471148725',
+  Bronze: '1480260972701552921',
+  Guest: '1232810267608354917'
+};
 
 const client = new Client({
   intents: [
@@ -507,6 +542,147 @@ function dedupeUsersByName(users) {
 }
 
 /* =========================
+   ROLE / RANK SYNC
+========================= */
+
+async function fetchRoleSyncRows() {
+  if (!ROLE_SYNC_URL) {
+    console.log(`[${nowIso()}] ROLE_SYNC_URL missing, skipping role sync.`);
+    return [];
+  }
+
+  try {
+    const res = await fetch(ROLE_SYNC_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        secret: ROLE_SYNC_SECRET || '',
+        type: 'role_sync_request'
+      })
+    });
+
+    const text = await res.text();
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}: ${text}`);
+    }
+
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error(`Invalid JSON response: ${text}`);
+    }
+
+    if (!Array.isArray(data)) {
+      console.log(`[${nowIso()}] Role sync response was not an array.`);
+      return [];
+    }
+
+    return data;
+  } catch (err) {
+    console.log(`[${nowIso()}] Failed fetching role sync rows: ${err.message}`);
+    return [];
+  }
+}
+
+function getDesiredLadderRoleId(row) {
+  const rank = String(row.rank || row.roleKey || '').trim();
+  if (!rank) return '';
+  return LADDER_ROLE_MAP[rank] || '';
+}
+
+function getAllManagedLadderRoleIds() {
+  return [...new Set(Object.values(LADDER_ROLE_MAP).filter(Boolean))];
+}
+
+async function syncMemberRolesFromRow(guild, row) {
+  const discordId = String(row.discordId || '').trim();
+  const rsn = String(row.rsn || '').trim();
+  const active = String(row.active ?? 'true').toLowerCase() !== 'false';
+
+  if (!discordId) return { ok: false, reason: 'missing_discord_id' };
+
+  const member = await guild.members.fetch(discordId).catch(() => null);
+  if (!member) return { ok: false, reason: 'member_not_found', discordId };
+
+  const desiredRoleId = active ? getDesiredLadderRoleId(row) : '';
+  const managedRoleIds = getAllManagedLadderRoleIds();
+
+  const currentManagedRoleIds = member.roles.cache
+    .filter(role => managedRoleIds.includes(role.id))
+    .map(role => role.id);
+
+  const toRemove = currentManagedRoleIds.filter(roleId => roleId !== desiredRoleId);
+  const toAdd = desiredRoleId && !currentManagedRoleIds.includes(desiredRoleId)
+    ? [desiredRoleId]
+    : [];
+
+  for (const roleId of toRemove) {
+    try {
+      await member.roles.remove(roleId, 'Shadowvale ladder role sync from sheet');
+    } catch (err) {
+      console.log(`[${nowIso()}] Failed removing ladder role ${roleId} from ${member.user.tag}: ${err.message}`);
+    }
+  }
+
+  for (const roleId of toAdd) {
+    try {
+      await member.roles.add(roleId, 'Shadowvale ladder role sync from sheet');
+    } catch (err) {
+      console.log(`[${nowIso()}] Failed adding ladder role ${roleId} to ${member.user.tag}: ${err.message}`);
+    }
+  }
+
+  if (SYNC_NICKNAME_TO_RSN && rsn) {
+    const currentNick = member.nickname || member.displayName || '';
+    if (currentNick !== rsn) {
+      try {
+        await member.setNickname(rsn, 'Shadowvale nickname sync from sheet');
+      } catch (err) {
+        console.log(`[${nowIso()}] Failed nickname sync for ${member.user.tag}: ${err.message}`);
+      }
+    }
+  }
+
+  return {
+    ok: true,
+    discordId,
+    rsn,
+    desiredRoleId,
+    added: toAdd.length,
+    removed: toRemove.length
+  };
+}
+
+async function syncRolesFromSheet(reason = 'manual') {
+  console.log(`[${nowIso()}] Role sync started (${reason})`);
+
+  try {
+    const guild = await client.guilds.fetch(GUILD_ID);
+    const rows = await fetchRoleSyncRows();
+
+    if (!rows.length) {
+      console.log(`[${nowIso()}] No role sync rows returned.`);
+      return;
+    }
+
+    let ok = 0;
+    let failed = 0;
+
+    for (const row of rows) {
+      const result = await syncMemberRolesFromRow(guild, row);
+      if (result.ok) ok += 1;
+      else failed += 1;
+    }
+
+    console.log(`[${nowIso()}] Role sync finished (${reason}) ok=${ok} failed=${failed}`);
+  } catch (err) {
+    console.log(`[${nowIso()}] Role sync failed (${reason}): ${err.message}`);
+  }
+}
+
+/* =========================
    SYNC
 ========================= */
 
@@ -683,6 +859,7 @@ client.once(Events.ClientReady, async () => {
 
   await syncExistingEventsAndUsers('startup');
   await syncGuildMembers('startup');
+  await syncRolesFromSheet('startup');
 
   setInterval(async () => {
     await syncExistingEventsAndUsers('interval');
@@ -691,6 +868,10 @@ client.once(Events.ClientReady, async () => {
   setInterval(async () => {
     await syncGuildMembers('interval');
   }, MEMBER_SYNC_INTERVAL_MS);
+
+  setInterval(async () => {
+    await syncRolesFromSheet('interval');
+  }, ROLE_SYNC_INTERVAL_MS);
 });
 
 client.on('guildScheduledEventCreate', async (event) => {
