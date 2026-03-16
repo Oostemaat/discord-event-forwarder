@@ -66,19 +66,12 @@ const client = new Client({
 
 const slashCommands = [
   new SlashCommandBuilder()
-    .setName('setuprsn')
-    .setDescription('Map a Discord user to an RSN and approve them')
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addUserOption(option =>
-      option
-        .setName('user')
-        .setDescription('Discord user to map')
-        .setRequired(true)
-    )
+    .setName('setrsn')
+    .setDescription('Set your own RuneScape name')
     .addStringOption(option =>
       option
         .setName('rsn')
-        .setDescription('RuneScape name')
+        .setDescription('Your full RuneScape name')
         .setRequired(true)
     ),
 
@@ -781,9 +774,10 @@ function getDesiredLadderRoleId(row) {
 
   return LADDER_ROLE_MAP[canonicalRank] || '';
 }
+
 function getAllManagedLadderRoleIds() {
   const excludedRoleIds = new Set([
-    '1178145449165725706', // Owner / Deputy_owner
+    '1178145449165725706', // Owner / Deputy_owner / Administrator
     '1269265842433036298'  // General / Champion
   ]);
 
@@ -895,18 +889,13 @@ async function syncRolesFromSheet(reason = 'manual') {
    COMMANDS
 ========================= */
 
-async function handleSetupRsnCommand(interaction) {
+async function handleSetRsnCommand(interaction) {
   await interaction.deferReply({ ephemeral: true });
 
   try {
-    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
-      await interaction.editReply('❌ You do not have permission to use this command.');
-      return;
-    }
-
-    const targetUser = interaction.options.getUser('user', true);
-    const rsn = cleanRsn(interaction.options.getString('rsn', true));
+    const targetUser = interaction.user;
     const guild = interaction.guild;
+    const rsn = cleanRsn(interaction.options.getString('rsn', true));
 
     if (!rsn) {
       await interaction.editReply('❌ RSN cannot be empty.');
@@ -924,30 +913,32 @@ async function handleSetupRsnCommand(interaction) {
       discordUsername: targetUser.username,
       displayName: member?.displayName || targetUser.globalName || targetUser.username,
       rsn,
-      approvedById: interaction.user.id,
-      approvedByTag: interaction.user.tag,
+      approvedById: targetUser.id,
+      approvedByTag: targetUser.tag,
       approvedAt: new Date().toISOString()
     };
 
     const data = await sendWebhookJson(payload);
 
     if (!data.ok) {
-      await interaction.editReply(`❌ Failed to set up RSN: ${data.error || 'Unknown error'}`);
+      await interaction.editReply(`❌ Failed to save RSN: ${data.error || 'Unknown error'}`);
       return;
     }
 
+    await syncRolesFromSheet('setrsn');
+    data.syncTriggered = true;
+
     let msg = '';
-    msg += `✅ RSN mapping saved and approved.\n`;
-    msg += `User: <@${targetUser.id}>\n`;
-    msg += `RSN: **${rsn}**\n`;
+    msg += `✅ Your RSN has been saved.\n`;
+    msg += `RSN: **${data.rsn || rsn}**\n`;
     msg += `Map row: ${data.updated ? 'updated' : 'created'}\n`;
     msg += `Unmapped row: ${data.removedFromUnmapped ? 'removed' : 'no match found'}\n`;
     msg += `Role sync: ${data.syncTriggered ? 'triggered' : 'not triggered'}`;
 
     await interaction.editReply(msg);
   } catch (err) {
-    console.log(`[${nowIso()}] setuprsn error: ${err.message}`);
-    await interaction.editReply(`❌ Error running setuprsn: ${err.message}`);
+    console.log(`[${nowIso()}] setrsn error: ${err.message}`);
+    await interaction.editReply(`❌ Error running setrsn: ${err.message}`);
   }
 }
 
@@ -983,6 +974,9 @@ async function handleRemoveRsnCommand(interaction) {
       await interaction.editReply(`❌ Failed to remove RSN: ${data.error || 'Unknown error'}`);
       return;
     }
+
+    await syncRolesFromSheet('removersn');
+    data.syncTriggered = true;
 
     let msg = '';
     msg += `✅ RSN mapping removed.\n`;
@@ -1195,8 +1189,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   if (interaction.guildId !== GUILD_ID) return;
 
-  if (interaction.commandName === 'setuprsn') {
-    await handleSetupRsnCommand(interaction);
+  if (interaction.commandName === 'setrsn') {
+    await handleSetRsnCommand(interaction);
     return;
   }
 
